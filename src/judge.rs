@@ -119,40 +119,7 @@ impl<S: Scorer> Judge<S> {
         for r in &raws {
             let t = self.cfg.calibration.temperature(r.kind, r.keys.len());
             let probs = softmax(&r.logprobs, t);
-            let answer = match r.kind {
-                "noul" => Answer::Noul {
-                    noul: round(probs[0]),
-                },
-                "choice" => {
-                    let best = argmax(&probs);
-                    Answer::Choice {
-                        choice: r.keys[best].clone(),
-                        probabilities: prob_map(&r.keys, &probs),
-                        confidence: round(confidence(&probs)),
-                    }
-                }
-                _ => {
-                    let legend: Map<String, Value> = match req.questions.get(&r.id) {
-                        Some(Value::Object(o)) => o
-                            .get("criteria")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .enumerate()
-                                    .map(|(i, v)| (i.to_string(), v.clone()))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        _ => Map::new(),
-                    };
-                    Answer::Score {
-                        score: round(expected_level(&probs)),
-                        legend,
-                        probabilities: prob_map(&r.keys, &probs),
-                        confidence: round(confidence(&probs)),
-                    }
-                }
-            };
+            let answer = make_answer(r.kind, &r.keys, &probs, req, &r.id);
             answers.insert(r.id.clone(), serde_json::to_value(answer).unwrap());
             // Only tokens the backend actually evaluated; cached prefix
             // tokens cost nothing and are reported under `debug`.
@@ -177,6 +144,45 @@ impl<S: Scorer> Judge<S> {
                 None
             },
         })
+    }
+}
+
+/// Build the wire `Answer` for one question from its calibrated option
+/// probabilities. Shared by the single-backend judge and the live ensemble.
+pub fn make_answer(kind: &str, keys: &[String], probs: &[f64], req: &Request, id: &str) -> Answer {
+    match kind {
+        "noul" => Answer::Noul {
+            noul: round(probs[0]),
+        },
+        "choice" => {
+            let best = argmax(probs);
+            Answer::Choice {
+                choice: keys[best].clone(),
+                probabilities: prob_map(keys, probs),
+                confidence: round(confidence(probs)),
+            }
+        }
+        _ => {
+            let legend: Map<String, Value> = match req.questions.get(id) {
+                Some(Value::Object(o)) => o
+                    .get("criteria")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .enumerate()
+                            .map(|(i, v)| (i.to_string(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Map::new(),
+            };
+            Answer::Score {
+                score: round(expected_level(probs)),
+                legend,
+                probabilities: prob_map(keys, probs),
+                confidence: round(confidence(probs)),
+            }
+        }
     }
 }
 

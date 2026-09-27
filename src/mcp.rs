@@ -14,6 +14,9 @@ use crate::protocol::Request;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// A judge in evaluation form: request -> full evaluation JSON.
+pub type Evaluator<'a> = &'a dyn Fn(&Request) -> Result<Value, BackendError>;
+
 fn tool_schema() -> Value {
     json!({
         "name": "judge",
@@ -52,6 +55,15 @@ fn tool_schema() -> Value {
 }
 
 pub fn serve<S: Scorer>(judge: &Judge<S>) -> io::Result<()> {
+    serve_with(&|req| {
+        let ev = judge.evaluate(req)?;
+        serde_json::to_value(&ev).map_err(|e| BackendError::Malformed(e.to_string()))
+    })
+}
+
+/// Serve MCP over stdio with an arbitrary evaluator (e.g. a live ensemble),
+/// so `jev --ensemble … mcp` exposes the meta-model as the `judge` tool.
+pub fn serve_with(evaluate: Evaluator) -> io::Result<()> {
     let stdin = io::stdin();
     let mut out = io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -87,7 +99,7 @@ pub fn serve<S: Scorer>(judge: &Judge<S>) -> io::Result<()> {
             ),
             "ping" => result(id, json!({})),
             "tools/list" => result(id, json!({"tools": [tool_schema()]})),
-            "tools/call" => call(judge, id, &params),
+            "tools/call" => call(evaluate, id, &params),
             _ => error(id, -32601, &format!("method not found: {method}")),
         };
         write_msg(&mut out, &reply)?;
@@ -95,7 +107,7 @@ pub fn serve<S: Scorer>(judge: &Judge<S>) -> io::Result<()> {
     Ok(())
 }
 
-fn call<S: Scorer>(judge: &Judge<S>, id: Value, params: &Value) -> Value {
+fn call(evaluate: Evaluator, id: Value, params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     if name != "judge" {
         return error(id, -32602, &format!("unknown tool: {name}"));
@@ -105,14 +117,18 @@ fn call<S: Scorer>(judge: &Judge<S>, id: Value, params: &Value) -> Value {
         Ok(r) => r,
         Err(e) => return tool_error(id, &format!("invalid arguments: {e}")),
     };
-    match judge.evaluate(&req) {
+    match evaluate(&req) {
         Ok(ev) => {
-            let text = serde_json::to_string_pretty(&ev.answers).unwrap_or_default();
+            let text = ev
+                .get("answers")
+                .cloned()
+                .map(|a| serde_json::to_string_pretty(&a).unwrap_or_default())
+                .unwrap_or_default();
             result(
                 id,
                 json!({
                     "content": [{"type": "text", "text": text}],
-                    "structuredContent": serde_json::to_value(&ev).unwrap_or(Value::Null),
+                    "structuredContent": ev,
                     "isError": false
                 }),
             )
@@ -120,7 +136,7 @@ fn call<S: Scorer>(judge: &Judge<S>, id: Value, params: &Value) -> Value {
         Err(BackendError::Rejected(m)) => tool_error(id, &m),
         Err(e) => tool_error(
             id,
-            &format!("backend unavailable: {e}. Is llama-server running? See README."),
+            &format!("backend unavailable: {e}. Are the member servers running? See README."),
         ),
     }
 }

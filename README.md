@@ -139,6 +139,7 @@ export TYPESAFE_BASE_URL=http://127.0.0.1:8090 TYPESAFE_API_KEY=local
 | `jev eval cases.jsonl` | accuracy, Brier, top-label ECE, coverage at ≤5 % error, latency, token cost |
 | `jev calibrate cases.jsonl` | fit per-bucket temperatures, write `calibration.json` (load with `--calibration`) |
 | `jev ensemble --rows a.jsonl --rows b.jsonl` | stack two or more backends' `eval --rows` files into one meta-predictor |
+| `jev --ensemble e.json --member name=kind,url …` | serve a fitted stacker live: fan out in parallel, answer from the meta-model |
 
 Case-file line: `{"state": ..., "questions": {...}, "gold": {"id": "key-or-level"}}`.
 
@@ -306,6 +307,26 @@ beat a member that is already right four times out of five on that tiny
 split; the win needs the larger bench. Members run in parallel, so the
 stacker's latency is the *sum* of member latencies (reported as such), and
 `fit` runs on the train split only — no optimistic in-sample numbers.
+
+The same model also serves live. `--ensemble` fans each request out to every
+`--member` backend **in parallel**, rebuilds the trained features (per-member
+temperature-calibrated probability vectors, kind one-hot, option count) and
+answers from the meta-model — so `ask`, `serve`, `eval` and the MCP path all
+return one ensemble answer instead of three. Member names and order must
+match the fitted model:
+
+```sh
+jev --ensemble ensemble.json \
+    --member 'llamacpp.rows=llamacpp,http://127.0.0.1:8089' \
+    --member 'laya.rows=laya,http://127.0.0.1:8010,typed-decisions' \
+    --member 'agentjev.rows=agentjev,http://127.0.0.1:8149' \
+    ask --state '…' --noul 'churn=…'
+```
+
+Live latency is then the *slowest* member, not the sum: a full
+`dev_tasks.jsonl` pass (75 cases, all three members) reports p50 ≈ 494 ms
+end-to-end at 0.747 accuracy, where the offline rows sum the three member
+latencies.
 
 ## The ecosystem, and where jev-rs sits
 

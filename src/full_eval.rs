@@ -6,8 +6,49 @@ use serde_json::Value;
 
 use crate::backend::{BackendError, FullBackend};
 use crate::eval::{self, Case, Row};
+use crate::judge::RawQuestion;
 use crate::protocol::{parse_questions, Question, Request};
 use crate::score::Calibration;
+
+/// (kind, keys) for one parsed question, in request order.
+fn kind_keys(q: &Question) -> (&'static str, Vec<String>) {
+    match q {
+        Question::Noul { .. } => ("noul", vec!["yes".to_string(), "no".to_string()]),
+        Question::Choice { criteria, .. } => {
+            ("choice", criteria.keys().cloned().collect::<Vec<_>>())
+        }
+        Question::Score { criteria, .. } => (
+            "score",
+            (0..criteria.len()).map(|i| i.to_string()).collect(),
+        ),
+    }
+}
+
+/// Convert a whole-request `answers` map into per-question raw log-probs —
+/// the same intermediate the Scorer path produces, so live ensemble members
+/// of both kinds feed identical features to the stacker.
+pub fn raw_from_answers(
+    req: &Request,
+    answers: &serde_json::Map<String, Value>,
+    latency_ms: f64,
+) -> Result<Vec<RawQuestion>, BackendError> {
+    let parsed = parse_questions(&req.questions).map_err(BackendError::Rejected)?;
+    let mut out = Vec::with_capacity(parsed.len());
+    for (id, q) in &parsed {
+        let (kind, keys) = kind_keys(q);
+        let logprobs = answer_logprobs(kind, &keys, answers.get(id).unwrap_or(&Value::Null))?;
+        out.push(RawQuestion {
+            id: id.clone(),
+            kind,
+            keys,
+            logprobs,
+            prompt_evaluated: 0,
+            prompt_cached: 0,
+            latency_ms,
+        });
+    }
+    Ok(out)
+}
 
 /// Run cases through a full-request backend. Latency recorded on each row is
 /// the whole-case wall time (how long a Jev-style multi-question call took).
@@ -32,16 +73,7 @@ pub fn run(backend: &dyn FullBackend, cases: &[Case]) -> Result<(Vec<Row>, usize
         let parsed = parse_questions(&req.questions).map_err(BackendError::Rejected)?;
         for (id, q) in &parsed {
             let Some(g) = c.gold.get(id) else { continue };
-            let (kind, keys) = match q {
-                Question::Noul { .. } => ("noul", vec!["yes".to_string(), "no".to_string()]),
-                Question::Choice { criteria, .. } => {
-                    ("choice", criteria.keys().cloned().collect::<Vec<_>>())
-                }
-                Question::Score { criteria, .. } => (
-                    "score",
-                    (0..criteria.len()).map(|i| i.to_string()).collect(),
-                ),
-            };
+            let (kind, keys) = kind_keys(q);
             let gold = match g {
                 Value::Number(n) => n.as_u64().map(|x| x as usize),
                 Value::String(s) => keys

@@ -61,6 +61,14 @@ struct Cli {
     /// Include raw logprobs and per-question latency in responses.
     #[arg(long)]
     debug: bool,
+    /// Fitted stacker JSON (from `jev ensemble --out`): fan every request out
+    /// to all --member backends in parallel and answer from the meta-model.
+    #[arg(long = "ensemble", env = "JEV_ENSEMBLE", global = true)]
+    stacker: Option<PathBuf>,
+    /// Live ensemble member: `name=kind,url[,model]` (name/order must match
+    /// the model's members; repeat once per member).
+    #[arg(long = "member", action = clap::ArgAction::Append)]
+    member: Vec<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -141,15 +149,16 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), String> {
-    let cli = Cli::parse();
-    let template: Template = cli.template.parse()?;
-    let calibration = match &cli.calibration {
-        Some(p) => serde_json::from_str(&std::fs::read_to_string(p).map_err(|e| e.to_string())?)
-            .map_err(|e| format!("calibration: {e}"))?,
-        None => Calibration::default(),
-    };
-    let engine = match cli.backend_kind.as_str() {
+/// Build the single-backend engine from kind/url/model.
+fn build_engine(
+    cli: &Cli,
+    kind: &str,
+    url: &str,
+    model: Option<&str>,
+    template: Template,
+    calibration: Calibration,
+) -> Result<Engine, String> {
+    match kind {
         "llamacpp" | "llama" => {
             let cfg = JudgeConfig {
                 template,
@@ -157,21 +166,18 @@ fn run() -> Result<(), String> {
                 permutations: cli.permutations,
                 debug: cli.debug,
             };
-            Engine::Scored(Judge::new(
-                Box::new(LlamaServer::new(cli.backend.clone())) as Box<dyn Scorer>,
+            Ok(Engine::Scored(Judge::new(
+                Box::new(LlamaServer::new(url.to_string())) as Box<dyn Scorer>,
                 cfg,
-            ))
+            )))
         }
         "openai" | "chat" => {
-            let model = cli
-                .model
-                .clone()
+            let model = model
+                .map(str::to_string)
+                .or_else(|| cli.model.clone())
                 .ok_or("--model is required with --backend-kind openai")?;
-            let mut s = OpenAiChat::new(
-                cli.backend.clone(),
-                model,
-                std::env::var(&cli.api_key_env).ok(),
-            );
+            let mut s =
+                OpenAiChat::new(url.to_string(), model, std::env::var(&cli.api_key_env).ok());
             if let Some(x) = &cli.extra {
                 s.extra = serde_json::from_str(x).map_err(|e| format!("--extra: {e}"))?;
             }
@@ -182,22 +188,89 @@ fn run() -> Result<(), String> {
                 permutations: cli.permutations,
                 debug: cli.debug,
             };
-            Engine::Scored(Judge::new(Box::new(s) as Box<dyn Scorer>, cfg))
+            Ok(Engine::Scored(Judge::new(
+                Box::new(s) as Box<dyn Scorer>,
+                cfg,
+            )))
         }
         "laya" | "systemone" => {
-            let model = cli
-                .model
-                .clone()
+            let model = model
+                .map(str::to_string)
+                .or_else(|| cli.model.clone())
                 .unwrap_or_else(|| "typed-decisions".into());
-            let name = cli.model.clone().unwrap_or_else(|| "systemone".into());
-            Engine::Full(Box::new(SystemOne::new(cli.backend.clone(), model, name)))
+            let name = model.clone();
+            Ok(Engine::Full(Box::new(SystemOne::new(
+                url.to_string(),
+                model,
+                name,
+            ))))
         }
-        "agentjev" => Engine::Full(Box::new(AgentJev::new(cli.backend.clone()))),
-        other => {
-            return Err(format!(
-                "unknown --backend-kind `{other}` (llamacpp|openai|laya|systemone|agentjev)"
-            ))
+        "agentjev" => Ok(Engine::Full(Box::new(AgentJev::new(url.to_string())))),
+        other => Err(format!(
+            "unknown backend kind `{other}` (llamacpp|openai|laya|systemone|agentjev)"
+        )),
+    }
+}
+
+/// Build one live ensemble member from a `name=kind,url[,model]` spec.
+fn build_member(
+    cli: &Cli,
+    spec: &str,
+    template: Template,
+    calibration: Calibration,
+) -> Result<Box<dyn jev_rs::ensemble::Member>, String> {
+    let (name, rest) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--member `{spec}`: expected name=kind,url[,model]"))?;
+    let mut parts = rest.splitn(3, ',');
+    let kind = parts.next().unwrap_or("");
+    let url = parts
+        .next()
+        .ok_or_else(|| format!("--member `{spec}`: missing url"))?;
+    let model = parts.next();
+    match build_engine(cli, kind, url, model, template, calibration)? {
+        Engine::Scored(judge) => Ok(Box::new(jev_rs::ensemble::JudgeMember {
+            name: name.to_string(),
+            judge,
+        })),
+        Engine::Full(backend) => Ok(Box::new(jev_rs::ensemble::FullMember {
+            name: name.to_string(),
+            backend,
+        })),
+    }
+}
+
+fn run() -> Result<(), String> {
+    let cli = Cli::parse();
+    let template: Template = cli.template.parse()?;
+    let calibration = match &cli.calibration {
+        Some(p) => serde_json::from_str(&std::fs::read_to_string(p).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("calibration: {e}"))?,
+        None => Calibration::default(),
+    };
+    let engine = match &cli.stacker {
+        Some(path) => {
+            let stacker = jev_rs::ensemble::Stacker::load(path)?;
+            if cli.member.is_empty() {
+                return Err("--ensemble requires one --member per member backend".into());
+            }
+            let members = cli
+                .member
+                .iter()
+                .map(|spec| build_member(&cli, spec, template, calibration.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Engine::Full(Box::new(jev_rs::ensemble::LiveStacker::new(
+                stacker, members,
+            )?))
         }
+        None => build_engine(
+            &cli,
+            &cli.backend_kind,
+            &cli.backend,
+            cli.model.as_deref(),
+            template,
+            calibration,
+        )?,
     };
 
     match cli.cmd {
@@ -298,7 +371,17 @@ fn run() -> Result<(), String> {
         }
         Cmd::Mcp => match engine {
             Engine::Scored(judge) => jev_rs::mcp::serve(&judge).map_err(|e| e.to_string()),
-            Engine::Full(_) => Err("--backend-kind mcp only supports llamacpp|openai".into()),
+            Engine::Full(b) => jev_rs::mcp::serve_with(&move |req: &Request| {
+                let t0 = std::time::Instant::now();
+                let (answers, ms) = b.evaluate(req)?;
+                Ok(json!({
+                    "model": b.model_name(),
+                    "answers": answers,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "latency_ms": ms.max(t0.elapsed().as_secs_f64() * 1e3),
+                }))
+            })
+            .map_err(|e| e.to_string()),
         },
         Cmd::Calibrate { file, out } => {
             let cases = eval::load_cases(&file)?;
