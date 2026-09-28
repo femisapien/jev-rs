@@ -88,7 +88,37 @@ pub fn load_rows(path: &Path) -> Result<Vec<Row>, String> {
         .filter(|l| !l.trim().is_empty())
         .enumerate()
         .map(|(i, l)| {
-            serde_json::from_str(l).map_err(|e| format!("{}: line {}: {e}", path.display(), i + 1))
+            let r: Row = serde_json::from_str(l)
+                .map_err(|e| format!("{}: line {}: {e}", path.display(), i + 1))?;
+            // Feeding an ill-shaped row into `fit_logreg` / `Calibration::fit`
+            // panics on index-out-of-range; reject it at load instead.
+            if r.n < 2 {
+                return Err(format!(
+                    "{}: line {}: n must be >= 2, got {}",
+                    path.display(),
+                    i + 1,
+                    r.n
+                ));
+            }
+            if r.raw_logprobs.len() != r.n {
+                return Err(format!(
+                    "{}: line {}: {} logprobs for n={}",
+                    path.display(),
+                    i + 1,
+                    r.raw_logprobs.len(),
+                    r.n
+                ));
+            }
+            if r.gold >= r.n {
+                return Err(format!(
+                    "{}: line {}: gold {} >= n {}",
+                    path.display(),
+                    i + 1,
+                    r.gold,
+                    r.n
+                ));
+            }
+            Ok(r)
         })
         .collect()
 }
@@ -160,7 +190,9 @@ impl Stacker {
 
     /// Probabilities over the question's `n` options (`n <= max_classes`).
     pub fn predict(&self, x: &[f64], n: usize) -> Vec<f64> {
-        let n = n.min(self.max_classes);
+        // Clamp to what the saved model actually holds: a hand-edited or
+        // truncated JSON must not index past the weight matrix.
+        let n = n.min(self.max_classes).min(self.weights.len());
         let logits: Vec<f64> = (0..n)
             .map(|c| {
                 self.weights[c]
@@ -181,6 +213,15 @@ impl Stacker {
             .get(member)
             .map(|c| c.temperature(kind, n))
             .unwrap_or(1.0)
+    }
+
+    /// This member's fitted temperature curve, or the identity for models
+    /// saved before `temps` existed.
+    pub fn member_cal(&self, member: usize) -> &Calibration {
+        static IDENTITY: std::sync::OnceLock<Calibration> = std::sync::OnceLock::new();
+        self.temps
+            .get(member)
+            .unwrap_or_else(|| IDENTITY.get_or_init(Calibration::default))
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -365,9 +406,11 @@ pub fn apply_report(
     let member: BTreeMap<String, Metrics> = (0..members.len())
         .map(|m| {
             let rows: Vec<Row> = aligned.iter().map(|a| a.rows[m].clone()).collect();
+            // Same view as fit_report: the member as the ensemble sees it,
+            // through the temperature fitted on the training split.
             (
                 names[m].clone(),
-                eval::metrics(&rows, 0, &Calibration::default()),
+                eval::metrics(&rows, 0, stacker.member_cal(m)),
             )
         })
         .collect();
@@ -458,6 +501,19 @@ impl FullBackend for LiveStacker {
         &self,
         req: &Request,
     ) -> Result<(serde_json::Map<String, serde_json::Value>, f64), BackendError> {
+        // Validate first: a request the stacker can't answer must be rejected
+        // before it costs one call to every member backend.
+        let parsed = parse_questions(&req.questions).map_err(BackendError::Rejected)?;
+        for (id, q) in &parsed {
+            let (_kind, keys) = full_eval::kind_keys(q);
+            if keys.len() > self.stacker.max_classes {
+                return Err(BackendError::Rejected(format!(
+                    "question `{id}`: {} options; this ensemble was fit with max_classes={}",
+                    keys.len(),
+                    self.stacker.max_classes
+                )));
+            }
+        }
         let t0 = std::time::Instant::now();
         // Fan out in parallel; members are Send + Sync.
         let raws: Vec<Vec<RawQuestion>> = std::thread::scope(|s| {
@@ -476,7 +532,6 @@ impl FullBackend for LiveStacker {
                 .collect::<Result<_, _>>()
         })?;
 
-        let parsed = parse_questions(&req.questions).map_err(BackendError::Rejected)?;
         if raws.iter().any(|r| r.len() != parsed.len()) {
             return Err(BackendError::Malformed(
                 "a member returned a different number of answers".into(),
@@ -494,12 +549,6 @@ impl FullBackend for LiveStacker {
             }
             let kind = r0.kind;
             let n = r0.keys.len();
-            if n > self.stacker.max_classes {
-                return Err(BackendError::Rejected(format!(
-                    "question `{id}`: {n} options; this ensemble was fit with max_classes={}",
-                    self.stacker.max_classes
-                )));
-            }
             let probs: Vec<Vec<f64>> = raws
                 .iter()
                 .enumerate()
@@ -669,6 +718,27 @@ mod tests {
     }
 
     #[test]
+    fn apply_report_handles_models_without_temps() {
+        // A model saved before `temps` existed: applying it must not panic and
+        // must score members through the identity temperature.
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for i in 0..100 {
+            let gold = i % 2;
+            a.push(row(i, gold, if gold == 0 { 0.9 } else { 0.1 }, 5.0));
+            b.push(row(i, gold, 0.5, 5.0));
+        }
+        let members = vec![("a".to_string(), a), ("b".to_string(), b)];
+        let (_report, mut stacker) = fit_report(&members, 0.3, 200, 1e-3).unwrap();
+        stacker.temps.clear();
+        let p = std::env::temp_dir().join("jev_stacker_no_temps.json");
+        stacker.save(&p).unwrap();
+        let v = apply_report(&p, &members).unwrap();
+        assert!(v["member"]["a"]["accuracy"].as_f64().unwrap() > 0.8);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
     fn split_is_deterministic_and_partitioned() {
         for i in 0..1000 {
             assert_eq!(is_test_case(i, 0.3), is_test_case(i, 0.3));
@@ -753,6 +823,127 @@ mod tests {
             other => panic!("expected noul, got {other:?}"),
         }
         assert_eq!(live.model_name(), "ensemble(hot+cold)");
+    }
+
+    #[test]
+    fn load_rows_rejects_ill_shaped_rows() {
+        // Regression: these fed fit_logreg / Calibration::fit and panicked.
+        let dir = std::env::temp_dir();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let good = r#"{"case_index":0,"id":"q","kind":"noul","n":2,"raw_logprobs":[0.0,-1.0],"gold":0,"latency_ms":1.0,"prompt_evaluated":0,"prompt_cached":0}"#;
+        let p = write("jev_rows_ok.jsonl", good);
+        assert!(load_rows(&p).is_ok());
+        let _ = std::fs::remove_file(p);
+
+        let bad_gold = r#"{"case_index":0,"id":"q","kind":"noul","n":2,"raw_logprobs":[0.0,-1.0],"gold":9,"latency_ms":1.0,"prompt_evaluated":0,"prompt_cached":0}"#;
+        let p = write("jev_rows_bad_gold.jsonl", bad_gold);
+        let e = load_rows(&p).unwrap_err();
+        assert!(e.contains("gold 9 >= n 2"), "{e}");
+        let _ = std::fs::remove_file(p);
+
+        let bad_len = r#"{"case_index":0,"id":"q","kind":"noul","n":3,"raw_logprobs":[0.0,-1.0],"gold":0,"latency_ms":1.0,"prompt_evaluated":0,"prompt_cached":0}"#;
+        let p = write("jev_rows_bad_len.jsonl", bad_len);
+        let e = load_rows(&p).unwrap_err();
+        assert!(e.contains("2 logprobs for n=3"), "{e}");
+        let _ = std::fs::remove_file(p);
+
+        let bad_n = r#"{"case_index":0,"id":"q","kind":"noul","n":1,"raw_logprobs":[0.0],"gold":0,"latency_ms":1.0,"prompt_evaluated":0,"prompt_cached":0}"#;
+        let p = write("jev_rows_bad_n.jsonl", bad_n);
+        let e = load_rows(&p).unwrap_err();
+        assert!(e.contains("n must be >= 2"), "{e}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// Records whether it was called, so we can assert pre-fan-out rejection.
+    struct ExplodingMember {
+        name: String,
+        called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Member for ExplodingMember {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn raw(&self, _req: &Request) -> Result<Vec<RawQuestion>, BackendError> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(BackendError::Http("should not be called".into()))
+        }
+    }
+
+    #[test]
+    fn live_stacker_rejects_before_fanning_out() {
+        let stacker = Stacker {
+            members: vec!["a".into(), "b".into()],
+            max_classes: 3,
+            dim: 9,
+            weights: vec![vec![0.0; 9], vec![0.0; 9], vec![0.0; 9]],
+            bias: vec![0.0; 3],
+            train_loss: 0.0,
+            iterations: 0,
+            lambda: 0.0,
+            temps: vec![],
+        };
+        let a_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let live = LiveStacker::new(
+            stacker,
+            vec![
+                Box::new(ExplodingMember {
+                    name: "a".into(),
+                    called: a_called.clone(),
+                }),
+                Box::new(ExplodingMember {
+                    name: "b".into(),
+                    called: b_called.clone(),
+                }),
+            ],
+        )
+        .unwrap();
+
+        // 4 options > max_classes=3: must be rejected without touching members.
+        let mut questions = serde_json::Map::new();
+        questions.insert(
+            "q".into(),
+            serde_json::json!({
+                "type": "choice",
+                "instructions": "pick",
+                "criteria": {"x": null, "y": null, "z": null, "w": null}
+            }),
+        );
+        let req = Request {
+            model: None,
+            state: serde_json::json!("s"),
+            questions,
+        };
+        let err = live.evaluate(&req).unwrap_err();
+        assert!(matches!(err, BackendError::Rejected(_)), "{err:?}");
+        assert!(
+            !a_called.load(std::sync::atomic::Ordering::SeqCst),
+            "member a must not be called for a request the stacker rejects"
+        );
+        assert!(
+            !b_called.load(std::sync::atomic::Ordering::SeqCst),
+            "member b must not be called for a request the stacker rejects"
+        );
+
+        // Unparsable request: same, rejected before any member call.
+        let req = Request {
+            model: None,
+            state: serde_json::json!("s"),
+            questions: serde_json::Map::new(),
+        };
+        assert!(matches!(
+            live.evaluate(&req).unwrap_err(),
+            BackendError::Rejected(_)
+        ));
+        assert!(
+            !a_called.load(std::sync::atomic::Ordering::SeqCst),
+            "member a must not be called for an unparsable request"
+        );
     }
 
     #[test]

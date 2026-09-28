@@ -11,7 +11,7 @@ use crate::protocol::{parse_questions, Question, Request};
 use crate::score::Calibration;
 
 /// (kind, keys) for one parsed question, in request order.
-fn kind_keys(q: &Question) -> (&'static str, Vec<String>) {
+pub(crate) fn kind_keys(q: &Question) -> (&'static str, Vec<String>) {
     match q {
         Question::Noul { .. } => ("noul", vec!["yes".to_string(), "no".to_string()]),
         Question::Choice { criteria, .. } => {
@@ -71,40 +71,45 @@ pub fn run(backend: &dyn FullBackend, cases: &[Case]) -> Result<(Vec<Row>, usize
             }
         };
         let parsed = parse_questions(&req.questions).map_err(BackendError::Rejected)?;
+        let mut case_rows = Vec::with_capacity(parsed.len());
+        let mut case_failed = false;
         for (id, q) in &parsed {
-            let Some(g) = c.gold.get(id) else { continue };
             let (kind, keys) = kind_keys(q);
-            let gold = match g {
-                Value::Number(n) => n.as_u64().map(|x| x as usize),
-                Value::String(s) => keys
-                    .iter()
-                    .position(|k| k == s)
-                    .or_else(|| s.parse().ok())
-                    .or(match s.as_str() {
-                        "true" => Some(0),
-                        "false" => Some(1),
-                        _ => None,
-                    }),
-                Value::Bool(b) => Some(if *b { 0 } else { 1 }),
-                _ => None,
-            };
-            let Some(gold) = gold else {
-                return Err(BackendError::Rejected(format!(
-                    "case {ci} question `{id}`: gold {g} is not an option"
-                )));
-            };
-            let logprobs = answer_logprobs(kind, &keys, answers.get(id).unwrap_or(&Value::Null))?;
-            rows.push(Row {
-                case_index: ci,
-                id: id.clone(),
-                kind: kind.to_string(),
-                n: keys.len(),
-                raw_logprobs: logprobs,
-                gold,
-                latency_ms: ms,
-                prompt_evaluated: 0,
-                prompt_cached: 0,
-            });
+            if let Some(g) = c.gold.get(id) {
+                let gold = eval::parse_gold(g, &keys).map_err(|m| {
+                    BackendError::Rejected(format!("case {ci} question `{id}`: {m}"))
+                })?;
+                // A missing or malformed answer is the backend's fault, not the
+                // case file's: count the case as failed instead of aborting the
+                // whole run (the Scorer path treats backend errors the same way).
+                let logprobs =
+                    match answer_logprobs(kind, &keys, answers.get(id).unwrap_or(&Value::Null)) {
+                        Ok(lp) => lp,
+                        Err(e) => {
+                            eprintln!("case {ci} question `{id}`: {e} (counted as failed)");
+                            case_failed = true;
+                            break;
+                        }
+                    };
+                case_rows.push(Row {
+                    case_index: ci,
+                    id: id.clone(),
+                    kind: kind.to_string(),
+                    n: keys.len(),
+                    raw_logprobs: logprobs,
+                    gold,
+                    latency_ms: ms,
+                    prompt_evaluated: 0,
+                    prompt_cached: 0,
+                });
+            }
+        }
+        if case_failed {
+            // A failed case contributes no rows (same contract as the Scorer
+            // path): `case_rows` is dropped rather than half-reported.
+            failed += 1;
+        } else {
+            rows.extend(case_rows);
         }
     }
     Ok((rows, failed))
@@ -167,4 +172,72 @@ pub fn metrics_pair(rows: &[Row], failed: usize) -> (eval::Metrics, eval::Metric
     let cal = eval::fit(rows);
     let fitted = eval::metrics(rows, failed, &cal);
     (raw, fitted, cal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendError;
+    use serde_json::json;
+
+    /// Answers only the first question of every request; omits the rest.
+    struct HalfAnswering;
+
+    impl FullBackend for HalfAnswering {
+        fn evaluate(
+            &self,
+            req: &Request,
+        ) -> Result<(serde_json::Map<String, Value>, f64), BackendError> {
+            let mut answers = serde_json::Map::new();
+            if let Some((id, _)) = req.questions.iter().next() {
+                answers.insert(id.clone(), json!({"type": "noul", "noul": 0.7}));
+            }
+            Ok((answers, 3.0))
+        }
+        fn model_name(&self) -> String {
+            "half".into()
+        }
+    }
+
+    fn case() -> Case {
+        let mut questions = serde_json::Map::new();
+        questions.insert("a".into(), json!({"type": "noul", "instructions": "one"}));
+        questions.insert("b".into(), json!({"type": "noul", "instructions": "two"}));
+        let mut gold = serde_json::Map::new();
+        gold.insert("a".into(), json!("yes"));
+        gold.insert("b".into(), json!("yes"));
+        Case {
+            model: None,
+            state: json!("s"),
+            questions,
+            gold,
+        }
+    }
+
+    #[test]
+    fn malformed_answer_counts_failed_case_not_run_abort() {
+        // Regression: one unanswered question used to abort the whole eval via
+        // `?` on answer_logprobs; now the case is counted as failed and the run
+        // continues (a failed case contributes no rows, per `eval::run`).
+        let (rows, failed) = run(&HalfAnswering, &[case()]).unwrap();
+        assert_eq!(failed, 1);
+        assert!(rows.is_empty(), "failed case contributes no rows");
+
+        // A second, fully-answered case still runs: the first failure did not
+        // abort the eval.
+        let mut c2 = case();
+        c2.questions.remove("b");
+        c2.gold.remove("b");
+        let (rows, failed) = run(&HalfAnswering, &[case(), c2]).unwrap();
+        assert_eq!(failed, 1);
+        assert_eq!(rows.len(), 1, "second case contributes its row");
+    }
+
+    #[test]
+    fn out_of_range_gold_is_rejected_not_panicked() {
+        let mut c = case();
+        c.gold.insert("a".into(), json!(9));
+        let err = run(&HalfAnswering, &[c]).unwrap_err();
+        assert!(matches!(err, BackendError::Rejected(_)), "{err:?}");
+    }
 }

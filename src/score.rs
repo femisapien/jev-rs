@@ -56,9 +56,14 @@ impl Calibration {
 
     /// Fit one temperature per bucket by grid search on negative
     /// log-likelihood. `samples` are `(bucket, raw_logprobs, gold_index)`.
+    /// Samples whose gold lies outside the option set carry no signal for that
+    /// bucket's temperature and are skipped (row construction rejects them).
     pub fn fit(samples: &[(String, Vec<f64>, usize)]) -> Self {
         let mut by_bucket: HashMap<String, Vec<(&Vec<f64>, usize)>> = HashMap::new();
         for (b, lp, g) in samples {
+            if *g >= lp.len() || lp.is_empty() {
+                continue;
+            }
             by_bucket.entry(b.clone()).or_default().push((lp, *g));
         }
         // 0.1 .. 30.0: instruct models are often so peaked that the optimum
@@ -150,5 +155,29 @@ mod tests {
         }
         let c = Calibration::fit(&s);
         assert!(c.temperature("choice", 2) > 3.0);
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn fit_skips_out_of_range_gold() {
+        // Regression: index out of bounds at score.rs:73 when a case file's
+        // gold was outside the option set.
+        let samples = vec![
+            ("noul:2".to_string(), vec![0.0, -1.0], 0),
+            ("noul:2".to_string(), vec![0.0, -1.0], 9),
+        ];
+        // Mixed in- and out-of-range: the bad sample is dropped, the good one
+        // still fits its bucket (a lone gold=0 sample fits toward t=30).
+        let c = Calibration::fit(&samples);
+        assert!(c.by_bucket.contains_key("noul:2"));
+        // Entirely out-of-range bucket: falls back to the default identity.
+        let only_bad = vec![("noul:2".to_string(), vec![0.0, -1.0], 9)];
+        let c2 = Calibration::fit(&only_bad);
+        assert!(c2.by_bucket.is_empty());
+        assert!((c2.temperature("noul", 2) - 1.0).abs() < 1e-9);
     }
 }

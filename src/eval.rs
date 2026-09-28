@@ -47,6 +47,32 @@ pub struct Row {
     pub prompt_cached: u64,
 }
 
+/// Map a case's `gold` value onto an option index in `keys`. Accepts the key
+/// itself, the index as a number or numeric string, booleans, and the strings
+/// `"true"`/`"false"` (noul). Returns an error when gold is not one of the
+/// options — an out-of-range index would later panic in `Calibration::fit` and
+/// `fit_logreg`, so it is rejected here instead.
+pub fn parse_gold(g: &Value, keys: &[String]) -> Result<usize, String> {
+    let idx = match g {
+        Value::Number(n) => n.as_u64().map(|x| x as usize),
+        Value::String(s) => keys
+            .iter()
+            .position(|k| k == s)
+            .or_else(|| s.parse().ok())
+            .or(match s.as_str() {
+                "true" => Some(0),
+                "false" => Some(1),
+                _ => None,
+            }),
+        Value::Bool(b) => Some(if *b { 0 } else { 1 }),
+        _ => None,
+    };
+    match idx {
+        Some(i) if i < keys.len() => Ok(i),
+        _ => Err(format!("gold {g} is not an option")),
+    }
+}
+
 /// Scored rows plus the number of cases whose backend call failed. A failed
 /// case contributes no rows; it is reported next to accuracy, as the public
 /// Jev benchmarks do. A rejected request (malformed case) still aborts.
@@ -70,22 +96,9 @@ pub fn run<S: Scorer>(judge: &Judge<S>, cases: &[Case]) -> Result<(Vec<Row>, usi
         };
         for r in raws {
             let Some(g) = c.gold.get(&r.id) else { continue };
-            let gold = match g {
-                Value::Number(n) => n.as_u64().map(|x| x as usize),
-                Value::String(s) => r
-                    .keys
-                    .iter()
-                    .position(|k| k == s)
-                    .or_else(|| s.parse().ok()),
-                Value::Bool(b) => Some(if *b { 0 } else { 1 }),
-                _ => None,
-            };
-            let Some(gold) = gold else {
-                return Err(BackendError::Rejected(format!(
-                    "case {ci} question `{}`: gold {g} is not an option",
-                    r.id
-                )));
-            };
+            let gold = parse_gold(g, &r.keys).map_err(|m| {
+                BackendError::Rejected(format!("case {ci} question `{}`: {m}", r.id))
+            })?;
             rows.push(Row {
                 case_index: ci,
                 id: r.id.clone(),
@@ -209,4 +222,43 @@ pub fn fit(rows: &[Row]) -> Calibration {
         })
         .collect();
     Calibration::fit(&samples)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn keys() -> Vec<String> {
+        vec!["yes".into(), "no".into()]
+    }
+
+    #[test]
+    fn parse_gold_accepts_documented_forms() {
+        assert_eq!(parse_gold(&json!("yes"), &keys()), Ok(0));
+        assert_eq!(parse_gold(&json!("1"), &keys()), Ok(1));
+        assert_eq!(parse_gold(&json!(0), &keys()), Ok(0));
+        assert_eq!(parse_gold(&json!(true), &keys()), Ok(0));
+        assert_eq!(parse_gold(&json!("true"), &keys()), Ok(0));
+        assert_eq!(parse_gold(&json!("false"), &keys()), Ok(1));
+    }
+
+    #[test]
+    fn parse_gold_rejects_out_of_range() {
+        // Regression: this used to build a row whose gold exceeded n and later
+        // panicked in Calibration::fit (index out of bounds).
+        assert!(parse_gold(&json!(9), &keys()).is_err());
+        assert!(parse_gold(&json!("9"), &keys()).is_err());
+        assert!(parse_gold(&json!(-1), &keys()).is_err());
+        assert!(parse_gold(&json!("maybe"), &keys()).is_err());
+        assert!(parse_gold(&json!(null), &keys()).is_err());
+    }
+
+    #[test]
+    fn fit_on_empty_rows_is_not_a_panic() {
+        let m = metrics(&[], 3, &Calibration::default());
+        assert_eq!(m.questions, 0);
+        assert_eq!(m.failed_cases, 3);
+        let _ = fit(&[]);
+    }
 }

@@ -8,7 +8,7 @@ use jev_rs::backend::llamacpp::LlamaServer;
 use jev_rs::backend::openai::OpenAiChat;
 use jev_rs::backend::systemone::SystemOne;
 use jev_rs::backend::typesafe::TypeSafe;
-use jev_rs::backend::{FullBackend, Scorer};
+use jev_rs::backend::{BackendError, FullBackend, Scorer};
 use jev_rs::eval;
 use jev_rs::full_eval;
 use jev_rs::judge::{Judge, JudgeConfig};
@@ -436,76 +436,91 @@ fn run() -> Result<(), String> {
 
 /// Minimal reverse proxy for whole-request backends on `jev serve`.
 fn serve_full(b: Box<dyn FullBackend>, cfg: ServerConfig) -> Result<(), String> {
-    use tiny_http::{Header, Method, Server};
+    use tiny_http::Server;
     let server = Server::http(&cfg.bind).map_err(|e| format!("bind {}: {e}", cfg.bind))?;
     eprintln!(
         "jev-rs (full) listening on http://{}  (model {})",
         cfg.bind,
         b.model_name()
     );
-    for mut req in server.incoming_requests() {
-        let path = req.url().split('?').next().unwrap_or("").to_string();
-        let method = req.method().clone();
-        let result: (u16, String) = match (&method, path.as_str()) {
-            (Method::Get, "/health") => (200, r#"{"status":"ok"}"#.into()),
-            (Method::Get, "/v1/models") => (
-                200,
-                json!({"object":"list","data":[{"id": b.model_name(), "object":"model"}]})
-                    .to_string(),
-            ),
-            (Method::Post, "/v1/systemone") => {
-                let authed = cfg.api_keys.is_empty()
-                    || req
-                        .headers()
-                        .iter()
-                        .find(|h| h.field.equiv("Authorization"))
-                        .and_then(|h| h.value.as_str().strip_prefix("Bearer ").map(String::from))
-                        .map(|t| cfg.api_keys.contains(&t))
-                        .unwrap_or(false);
-                if !authed {
-                    (
-                        401,
-                        json!({"message":"invalid or missing API key"}).to_string(),
-                    )
+    let b = std::sync::Arc::new(b);
+    let keys = std::sync::Arc::new(cfg.api_keys);
+    for req in server.incoming_requests() {
+        // One thread per request: a live ensemble's fan-out would otherwise
+        // serialize every client behind the slowest member.
+        let b = b.clone();
+        let keys = keys.clone();
+        std::thread::spawn(move || handle_full(req, &**b, keys.as_slice()));
+    }
+    Ok(())
+}
+
+fn handle_full(mut req: tiny_http::Request, b: &dyn FullBackend, keys: &[String]) {
+    use tiny_http::{Header, Method};
+    let path = req.url().split('?').next().unwrap_or("").to_string();
+    let method = req.method().clone();
+    let result: (u16, String) = match (&method, path.as_str()) {
+        (Method::Get, "/health") => (200, r#"{"status":"ok"}"#.into()),
+        (Method::Get, "/v1/models") => (
+            200,
+            json!({"object":"list","data":[{"id": b.model_name(), "object":"model"}]}).to_string(),
+        ),
+        (Method::Post, "/v1/systemone") => {
+            let authed = keys.is_empty()
+                || req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Authorization"))
+                    .and_then(|h| h.value.as_str().strip_prefix("Bearer ").map(String::from))
+                    .map(|t| keys.contains(&t))
+                    .unwrap_or(false);
+            if !authed {
+                (
+                    401,
+                    json!({"message":"invalid or missing API key"}).to_string(),
+                )
+            } else {
+                let mut body = String::new();
+                if req.as_reader().read_to_string(&mut body).is_err() {
+                    (400, json!({"message":"unreadable body"}).to_string())
                 } else {
-                    let mut body = String::new();
-                    if req.as_reader().read_to_string(&mut body).is_err() {
-                        (400, json!({"message":"unreadable body"}).to_string())
-                    } else {
-                        match serde_json::from_str::<Request>(&body) {
-                            Err(e) => (
-                                422,
-                                json!({"message": format!("invalid request: {e}")}).to_string(),
+                    match serde_json::from_str::<Request>(&body) {
+                        Err(e) => (
+                            422,
+                            json!({"message": format!("invalid request: {e}")}).to_string(),
+                        ),
+                        Ok(r) => match b.evaluate(&r) {
+                            Ok((answers, ms)) => (
+                                200,
+                                json!({
+                                    "model": b.model_name(),
+                                    "answers": answers,
+                                    "usage": {"input_tokens":0,"output_tokens":0},
+                                    "latency_ms": ms,
+                                })
+                                .to_string(),
                             ),
-                            Ok(r) => match b.evaluate(&r) {
-                                Ok((answers, ms)) => (
-                                    200,
-                                    json!({
-                                        "model": b.model_name(),
-                                        "answers": answers,
-                                        "usage": {"input_tokens":0,"output_tokens":0},
-                                        "latency_ms": ms,
-                                    })
-                                    .to_string(),
-                                ),
-                                Err(e) => (502, json!({"message": e.to_string()}).to_string()),
-                            },
-                        }
+                            // Rejected is a client error (bad question, too many
+                            // options) — 422, exactly like the scored server.
+                            Err(BackendError::Rejected(m)) => {
+                                (422, json!({"message": m}).to_string())
+                            }
+                            Err(e) => (502, json!({"message": e.to_string()}).to_string()),
+                        },
                     }
                 }
             }
-            _ => (
-                404,
-                json!({"message": format!("no route {} {}", method, path)}).to_string(),
-            ),
-        };
-        let json_hdr = Header::from_bytes("Content-Type", "application/json").unwrap();
-        let resp = tiny_http::Response::from_string(result.1)
-            .with_status_code(result.0)
-            .with_header(json_hdr);
-        let _ = req.respond(resp);
-    }
-    Ok(())
+        }
+        _ => (
+            404,
+            json!({"message": format!("no route {} {}", method, path)}).to_string(),
+        ),
+    };
+    let json_hdr = Header::from_bytes("Content-Type", "application/json").unwrap();
+    let resp = tiny_http::Response::from_string(result.1)
+        .with_status_code(result.0)
+        .with_header(json_hdr);
+    let _ = req.respond(resp);
 }
 
 fn build_request(

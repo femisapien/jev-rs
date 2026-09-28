@@ -136,7 +136,7 @@ fn call(evaluate: Evaluator, id: Value, params: &Value) -> Value {
         Err(BackendError::Rejected(m)) => tool_error(id, &m),
         Err(e) => tool_error(
             id,
-            &format!("backend unavailable: {e}. Are the member servers running? See README."),
+            &format!("backend unavailable: {e}. Is the backend running? See README."),
         ),
     }
 }
