@@ -304,9 +304,10 @@ generalist's probability vector carries signal the two specialists lack
 (0.548 alone, yet the ensemble is above the best specialist). On
 `dev_tasks.jsonl` — 12 test questions, llamacpp at 0.833 — no ensemble can
 beat a member that is already right four times out of five on that tiny
-split; the win needs the larger bench. Members run in parallel, so the
-stacker's latency is the *sum* of member latencies (reported as such), and
-`fit` runs on the train split only — no optimistic in-sample numbers.
+split; the win needs the larger bench. The offline report *sums* each
+member's recorded latency — the rows come from three separate passes, so
+that figure is a sequential cost, not what a live fan-out pays — and `fit`
+runs on the train split only, no optimistic in-sample numbers.
 
 The same model also serves live. `--ensemble` fans each request out to every
 `--member` backend **in parallel**, rebuilds the trained features (per-member
@@ -323,10 +324,12 @@ jev --ensemble ensemble.json \
     ask --state '…' --noul 'churn=…'
 ```
 
-Live latency is then the *slowest* member, not the sum: a full
-`dev_tasks.jsonl` pass (75 cases, all three members) reports p50 ≈ 494 ms
-end-to-end at 0.747 accuracy, where the offline rows sum the three member
-latencies.
+Live latency is then the *slowest* member, not the sum. Measured on the
+same day (`dev_tasks.jsonl`, 75 cases): members at 64 / 41 / 492 ms p50 —
+597 ms if run in sequence — versus **495 ms** for the ensemble itself, i.e.
+the fan-out waits on the slowest member while the other two ride along.
+The 0.747 accuracy that same pass prints is in-sample (these are the rows
+`fit` trained on) and is *not* a held-out number; use the table above.
 
 ## The ecosystem, and where jev-rs sits
 
